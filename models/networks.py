@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
@@ -174,6 +175,42 @@ def _parse_resunet_spec(netG, default_num_downs=8, default_bottleneck_blocks=4):
     return num_downs, bottleneck_blocks
 
 
+def _parse_unetpp_spec(netG, default_num_stages=4):
+    """Parse Unet++ configuration from a netG string.
+
+    Supported forms:
+        UnetPP
+        UnetPP_256
+        UnetPP_d4
+        UnetPP_256_d4
+
+    For canonical image-size tokens (128/256/512), this implementation uses
+    the default 4-stage UNet++ topology. Explicit stage depth can be provided
+    with tokens like d4/d5/d6.
+    """
+    spec = str(netG).lower().replace("unet++", "unetpp").replace("unet_plus_plus", "unetpp")
+    if not spec.startswith("unetpp"):
+        return None
+
+    num_stages = default_num_stages
+    suffix = spec[len("unetpp"):].strip("_")
+    if suffix:
+        for token in suffix.split("_"):
+            if not token:
+                continue
+            if token.startswith("d") and token[1:].isdigit():
+                num_stages = int(token[1:])
+                continue
+            if token.isdigit():
+                value = int(token)
+                if value in (128, 256, 512):
+                    num_stages = default_num_stages
+                elif 2 <= value <= 7:
+                    num_stages = value
+
+    return max(2, num_stages)
+
+
 def define_G(input_nc, output_nc, ngf, netG, norm="batch", use_dropout=False, init_type="normal", init_gain=0.02):
     """Create a generator
 
@@ -181,7 +218,7 @@ def define_G(input_nc, output_nc, ngf, netG, norm="batch", use_dropout=False, in
         input_nc (int) -- the number of channels in input images
         output_nc (int) -- the number of channels in output images
         ngf (int) -- the number of filters in the last conv layer
-        netG (str) -- the architecture's name: resnet_9blocks | resnet_6blocks | unet_128 | unet_256 | ResUnet
+        netG (str) -- the architecture's name: resnet_9blocks | resnet_6blocks | unet_128 | unet_256 | ResUnet | UnetPP
         norm (str) -- the name of normalization layers used in the network: batch | instance | none
         use_dropout (bool) -- if use dropout layers.
         init_type (str)    -- the name of our initialization method.
@@ -201,20 +238,31 @@ def define_G(input_nc, output_nc, ngf, netG, norm="batch", use_dropout=False, in
     elif netG == "unet_256":
         net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     else:
-        resunet_spec = _parse_resunet_spec(netG)
-        if resunet_spec is not None:
-            num_downs, bottleneck_blocks = resunet_spec
-            net = ResUnetGenerator(
+        unetpp_spec = _parse_unetpp_spec(netG)
+        if unetpp_spec is not None:
+            net = UnetPlusPlusGenerator(
                 input_nc,
                 output_nc,
-                num_downs,
-                ngf,
+                num_stages=unetpp_spec,
+                ngf=ngf,
                 norm_layer=norm_layer,
                 use_dropout=use_dropout,
-                bottleneck_blocks=bottleneck_blocks,
             )
         else:
-            raise NotImplementedError("Generator model name [%s] is not recognized" % netG)
+            resunet_spec = _parse_resunet_spec(netG)
+            if resunet_spec is not None:
+                num_downs, bottleneck_blocks = resunet_spec
+                net = ResUnetGenerator(
+                    input_nc,
+                    output_nc,
+                    num_downs,
+                    ngf,
+                    norm_layer=norm_layer,
+                    use_dropout=use_dropout,
+                    bottleneck_blocks=bottleneck_blocks,
+                )
+            else:
+                raise NotImplementedError("Generator model name [%s] is not recognized" % netG)
     return net
 
 
@@ -477,6 +525,79 @@ class ResnetBlock(nn.Module):
         """Forward function (with skip connections)"""
         out = x + self.conv_block(x)  # add skip connections
         return out
+
+
+class _UnetPPConvBlock(nn.Module):
+    """Two-conv block used by UNet++."""
+
+    def __init__(self, input_nc, output_nc, norm_layer=nn.BatchNorm2d, use_dropout=False):
+        super(_UnetPPConvBlock, self).__init__()
+        if type(norm_layer) == functools.partial:
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
+
+        layers = [
+            nn.Conv2d(input_nc, output_nc, kernel_size=3, stride=1, padding=1, bias=use_bias),
+            norm_layer(output_nc),
+            nn.ReLU(True),
+            nn.Conv2d(output_nc, output_nc, kernel_size=3, stride=1, padding=1, bias=use_bias),
+            norm_layer(output_nc),
+            nn.ReLU(True),
+        ]
+        if use_dropout:
+            layers.append(nn.Dropout2d(0.5))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class UnetPlusPlusGenerator(nn.Module):
+    """Create a UNet++ (nested U-Net) generator."""
+
+    def __init__(self, input_nc, output_nc, num_stages=5, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False):
+        super(UnetPlusPlusGenerator, self).__init__()
+        if num_stages < 2:
+            raise ValueError("num_stages for UnetPlusPlusGenerator must be >= 2")
+
+        self.num_stages = num_stages
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.channels = [min(ngf * (2 ** i), ngf * 8) for i in range(num_stages)]
+
+        self.nodes = nn.ModuleDict()
+        for j in range(num_stages):
+            for i in range(num_stages - j):
+                if j == 0:
+                    in_ch = input_nc if i == 0 else self.channels[i - 1]
+                else:
+                    in_ch = self.channels[i + 1] + j * self.channels[i]
+                out_ch = self.channels[i]
+                self.nodes[f"x_{i}_{j}"] = _UnetPPConvBlock(in_ch, out_ch, norm_layer=norm_layer, use_dropout=use_dropout)
+
+        self.head = nn.Sequential(
+            nn.Conv2d(self.channels[0], output_nc, kernel_size=1, stride=1, padding=0),
+            nn.Tanh(),
+        )
+
+    def forward(self, input):
+        nodes = {}
+
+        for i in range(self.num_stages):
+            if i == 0:
+                current = input
+            else:
+                current = self.pool(nodes[f"x_{i - 1}_0"])
+            nodes[f"x_{i}_0"] = self.nodes[f"x_{i}_0"](current)
+
+        for j in range(1, self.num_stages):
+            for i in range(self.num_stages - j):
+                up = F.interpolate(nodes[f"x_{i + 1}_{j - 1}"], size=nodes[f"x_{i}_0"].shape[2:], mode="bilinear", align_corners=False)
+                dense = [nodes[f"x_{i}_{k}"] for k in range(j)]
+                merged = torch.cat(dense + [up], dim=1)
+                nodes[f"x_{i}_{j}"] = self.nodes[f"x_{i}_{j}"](merged)
+
+        return self.head(nodes[f"x_0_{self.num_stages - 1}"])
 
 
 class ResUnetGenerator(nn.Module):
