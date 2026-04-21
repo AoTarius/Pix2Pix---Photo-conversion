@@ -211,6 +211,58 @@ def _parse_unetpp_spec(netG, default_num_stages=4):
     return max(2, num_stages)
 
 
+def _parse_mobilenet_spec(netG, default_width_mult=0.5, default_bottleneck_blocks=2, default_num_downs=4, default_expand_ratio=2.0):
+    """Parse MobileNet configuration from a netG string.
+
+    Supported forms:
+        MobileNet
+        MobileNet_w0.5
+        MobileNet_b2
+        MobileNet_w0.5_b2
+
+    The default configuration is intentionally lightweight so it can be used
+    as a fast test-time generator.
+    """
+    spec = str(netG).lower().replace("mobilenetv2", "mobilenet").replace("mobile_net", "mobilenet")
+    if not spec.startswith("mobilenet"):
+        return None
+
+    width_mult = default_width_mult
+    bottleneck_blocks = default_bottleneck_blocks
+    num_downs = default_num_downs
+    expand_ratio = default_expand_ratio
+
+    suffix = spec[len("mobilenet"):].strip("_")
+    if suffix:
+        for token in suffix.split("_"):
+            if not token:
+                continue
+            if token.startswith("b") and token[1:].isdigit():
+                bottleneck_blocks = int(token[1:])
+                continue
+            if token.startswith("d") and token[1:].isdigit():
+                num_downs = max(2, int(token[1:]))
+                continue
+            if token.startswith("e") and token[1:]:
+                try:
+                    expand_ratio = float(token[1:])
+                except ValueError:
+                    pass
+                continue
+            if token.startswith("w") and token[1:]:
+                try:
+                    width_mult = float(token[1:])
+                except ValueError:
+                    pass
+                continue
+            if token.isdigit():
+                value = int(token)
+                if value in (128, 256, 512):
+                    num_downs = default_num_downs
+
+    return width_mult, bottleneck_blocks, num_downs, expand_ratio
+
+
 def define_G(input_nc, output_nc, ngf, netG, norm="batch", use_dropout=False, init_type="normal", init_gain=0.02):
     """Create a generator
 
@@ -218,7 +270,7 @@ def define_G(input_nc, output_nc, ngf, netG, norm="batch", use_dropout=False, in
         input_nc (int) -- the number of channels in input images
         output_nc (int) -- the number of channels in output images
         ngf (int) -- the number of filters in the last conv layer
-        netG (str) -- the architecture's name: resnet_9blocks | resnet_6blocks | unet_128 | unet_256 | ResUnet | UnetPP
+        netG (str) -- the architecture's name: resnet_9blocks | resnet_6blocks | unet_128 | unet_256 | MobileNet | ResUnet | UnetPP
         norm (str) -- the name of normalization layers used in the network: batch | instance | none
         use_dropout (bool) -- if use dropout layers.
         init_type (str)    -- the name of our initialization method.
@@ -238,31 +290,46 @@ def define_G(input_nc, output_nc, ngf, netG, norm="batch", use_dropout=False, in
     elif netG == "unet_256":
         net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     else:
-        unetpp_spec = _parse_unetpp_spec(netG)
-        if unetpp_spec is not None:
-            net = UnetPlusPlusGenerator(
+        mobilenet_spec = _parse_mobilenet_spec(netG)
+        if mobilenet_spec is not None:
+            width_mult, bottleneck_blocks, num_downs, expand_ratio = mobilenet_spec
+            net = MobileNetGenerator(
                 input_nc,
                 output_nc,
-                num_stages=unetpp_spec,
                 ngf=ngf,
+                width_mult=width_mult,
+                bottleneck_blocks=bottleneck_blocks,
+                num_downs=num_downs,
+                expand_ratio=expand_ratio,
                 norm_layer=norm_layer,
                 use_dropout=use_dropout,
             )
         else:
-            resunet_spec = _parse_resunet_spec(netG)
-            if resunet_spec is not None:
-                num_downs, bottleneck_blocks = resunet_spec
-                net = ResUnetGenerator(
+            unetpp_spec = _parse_unetpp_spec(netG)
+            if unetpp_spec is not None:
+                net = UnetPlusPlusGenerator(
                     input_nc,
                     output_nc,
-                    num_downs,
-                    ngf,
+                    num_stages=unetpp_spec,
+                    ngf=ngf,
                     norm_layer=norm_layer,
                     use_dropout=use_dropout,
-                    bottleneck_blocks=bottleneck_blocks,
                 )
             else:
-                raise NotImplementedError("Generator model name [%s] is not recognized" % netG)
+                resunet_spec = _parse_resunet_spec(netG)
+                if resunet_spec is not None:
+                    num_downs, bottleneck_blocks = resunet_spec
+                    net = ResUnetGenerator(
+                        input_nc,
+                        output_nc,
+                        num_downs,
+                        ngf,
+                        norm_layer=norm_layer,
+                        use_dropout=use_dropout,
+                        bottleneck_blocks=bottleneck_blocks,
+                    )
+                else:
+                    raise NotImplementedError("Generator model name [%s] is not recognized" % netG)
     return net
 
 
@@ -692,6 +759,169 @@ class ResUnetGenerator(nn.Module):
         x = self.bottleneck(x)
 
         for up_block, skip in zip(self.up_blocks, reversed(skips)):
+            x = up_block(x, skip)
+
+        return self.head(x)
+
+
+class _MobileNetConvBNReLU(nn.Module):
+    """Conv-BN-ReLU block used by the MobileNet-style generator."""
+
+    def __init__(self, input_nc, output_nc, kernel_size=3, stride=1, groups=1, norm_layer=nn.BatchNorm2d, activation=True):
+        super(_MobileNetConvBNReLU, self).__init__()
+        if type(norm_layer) == functools.partial:
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
+
+        padding = kernel_size // 2
+        layers = [
+            nn.Conv2d(input_nc, output_nc, kernel_size=kernel_size, stride=stride, padding=padding, groups=groups, bias=use_bias),
+            norm_layer(output_nc),
+        ]
+        if activation:
+            layers.append(nn.ReLU(inplace=True))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class _MobileNetInvertedResidual(nn.Module):
+    """Lightweight inverted residual block."""
+
+    def __init__(self, input_nc, output_nc, stride=1, expand_ratio=2.0, norm_layer=nn.BatchNorm2d):
+        super(_MobileNetInvertedResidual, self).__init__()
+        if type(norm_layer) == functools.partial:
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
+
+        hidden_nc = max(1, int(round(input_nc * expand_ratio)))
+        self.use_residual = stride == 1 and input_nc == output_nc
+        layers = []
+        if hidden_nc != input_nc:
+            layers += [
+                nn.Conv2d(input_nc, hidden_nc, kernel_size=1, stride=1, padding=0, bias=use_bias),
+                norm_layer(hidden_nc),
+                nn.ReLU(inplace=True),
+            ]
+        layers += [
+            nn.Conv2d(hidden_nc, hidden_nc, kernel_size=3, stride=stride, padding=1, groups=hidden_nc, bias=use_bias),
+            norm_layer(hidden_nc),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_nc, output_nc, kernel_size=1, stride=1, padding=0, bias=use_bias),
+            norm_layer(output_nc),
+        ]
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.block(x)
+        if self.use_residual:
+            out = out + x
+        return out
+
+
+class _MobileNetDownBlock(nn.Module):
+    """MobileNet-style encoder block with strided downsampling."""
+
+    def __init__(self, input_nc, output_nc, expand_ratio=2.0, norm_layer=nn.BatchNorm2d):
+        super(_MobileNetDownBlock, self).__init__()
+        self.block = nn.Sequential(
+            _MobileNetInvertedResidual(input_nc, output_nc, stride=2, expand_ratio=expand_ratio, norm_layer=norm_layer),
+            _MobileNetInvertedResidual(output_nc, output_nc, stride=1, expand_ratio=expand_ratio, norm_layer=norm_layer),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class _MobileNetUpBlock(nn.Module):
+    """MobileNet-style decoder block with skip fusion."""
+
+    def __init__(self, input_nc, skip_nc, output_nc, expand_ratio=2.0, norm_layer=nn.BatchNorm2d, use_dropout=False):
+        super(_MobileNetUpBlock, self).__init__()
+        if type(norm_layer) == functools.partial:
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
+
+        fused_nc = input_nc + skip_nc
+        hidden_nc = max(output_nc, int(round(output_nc * expand_ratio)))
+        layers = [
+            nn.Conv2d(fused_nc, output_nc, kernel_size=1, stride=1, padding=0, bias=use_bias),
+            norm_layer(output_nc),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(output_nc, output_nc, kernel_size=3, stride=1, padding=1, groups=output_nc, bias=use_bias),
+            norm_layer(output_nc),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(output_nc, hidden_nc, kernel_size=1, stride=1, padding=0, bias=use_bias),
+            norm_layer(hidden_nc),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_nc, output_nc, kernel_size=1, stride=1, padding=0, bias=use_bias),
+            norm_layer(output_nc),
+            nn.ReLU(inplace=True),
+        ]
+        if use_dropout:
+            layers.append(nn.Dropout2d(0.2))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x, skip):
+        x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.block(x)
+
+
+class MobileNetGenerator(nn.Module):
+    """A lightweight MobileNet-style encoder-decoder generator."""
+
+    def __init__(self, input_nc, output_nc, ngf=64, width_mult=0.5, bottleneck_blocks=2, num_downs=4, expand_ratio=2.0, norm_layer=nn.BatchNorm2d, use_dropout=False):
+        super(MobileNetGenerator, self).__init__()
+        if num_downs < 2:
+            raise ValueError("num_downs for MobileNetGenerator must be >= 2")
+
+        def scale(channels):
+            return max(8, int(round(channels * width_mult)))
+
+        stem_nc = scale(max(8, ngf // 2))
+        self.stem = _MobileNetConvBNReLU(input_nc, stem_nc, kernel_size=3, stride=1, norm_layer=norm_layer)
+
+        encoder_base = [scale(v) for v in [ngf // 2, ngf, ngf + ngf // 2, ngf * 2]]
+        while len(encoder_base) < num_downs:
+            encoder_base.append(scale(encoder_base[-1] + ngf // 2))
+        self.encoder_channels = encoder_base[:num_downs]
+
+        self.down_blocks = nn.ModuleList()
+        in_channels = stem_nc
+        for out_channels in self.encoder_channels:
+            self.down_blocks.append(_MobileNetDownBlock(in_channels, out_channels, expand_ratio=expand_ratio, norm_layer=norm_layer))
+            in_channels = out_channels
+
+        bottleneck = []
+        for _ in range(bottleneck_blocks):
+            bottleneck.append(_MobileNetInvertedResidual(in_channels, in_channels, stride=1, expand_ratio=expand_ratio, norm_layer=norm_layer))
+        self.bottleneck = nn.Sequential(*bottleneck)
+
+        self.up_blocks = nn.ModuleList()
+        for skip_channels in reversed([stem_nc] + self.encoder_channels[:-1]):
+            self.up_blocks.append(_MobileNetUpBlock(in_channels, skip_channels, skip_channels, expand_ratio=expand_ratio, norm_layer=norm_layer, use_dropout=use_dropout))
+            in_channels = skip_channels
+
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, output_nc, kernel_size=1, stride=1, padding=0),
+            nn.Tanh(),
+        )
+
+    def forward(self, input):
+        x = self.stem(input)
+        skips = [x]
+        for down_block in self.down_blocks:
+            x = down_block(x)
+            skips.append(x)
+
+        x = self.bottleneck(x)
+
+        for up_block, skip in zip(self.up_blocks, reversed(skips[:-1])):
             x = up_block(x, skip)
 
         return self.head(x)
