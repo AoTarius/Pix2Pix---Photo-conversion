@@ -129,6 +129,51 @@ def init_net(net, init_type="normal", init_gain=0.02):
     return net
 
 
+def _parse_resunet_spec(netG, default_num_downs=8, default_bottleneck_blocks=4):
+    """Parse ResUnet configuration from a netG string.
+
+    Supported forms:
+        ResUnet
+        ResUnet_256
+        ResUnet_128
+        ResUnet_8
+        ResUnet_8_b4
+        ResUnet_b6
+
+    The first numeric token is interpreted as either a canonical image size
+    or the explicit number of downsampling stages. A token such as 'b4'
+    overrides the number of bottleneck residual blocks.
+    """
+    spec = str(netG).lower()
+    if not spec.startswith("resunet"):
+        return None
+
+    num_downs = default_num_downs
+    bottleneck_blocks = default_bottleneck_blocks
+    suffix = spec[len("resunet"):].strip("_")
+    if suffix:
+        for token in suffix.split("_"):
+            if not token:
+                continue
+            if token.startswith("b") and token[1:].isdigit():
+                bottleneck_blocks = int(token[1:])
+                continue
+            if token.isdigit():
+                value = int(token)
+                if value == 128:
+                    num_downs = 7
+                elif value == 256:
+                    num_downs = 8
+                elif value == 512:
+                    num_downs = 9
+                elif value >= 5:
+                    num_downs = value
+                else:
+                    bottleneck_blocks = value
+
+    return num_downs, bottleneck_blocks
+
+
 def define_G(input_nc, output_nc, ngf, netG, norm="batch", use_dropout=False, init_type="normal", init_gain=0.02):
     """Create a generator
 
@@ -136,7 +181,7 @@ def define_G(input_nc, output_nc, ngf, netG, norm="batch", use_dropout=False, in
         input_nc (int) -- the number of channels in input images
         output_nc (int) -- the number of channels in output images
         ngf (int) -- the number of filters in the last conv layer
-        netG (str) -- the architecture's name: resnet_9blocks | resnet_6blocks | unet_128 | unet_256
+        netG (str) -- the architecture's name: resnet_9blocks | resnet_6blocks | unet_128 | unet_256 | ResUnet
         norm (str) -- the name of normalization layers used in the network: batch | instance | none
         use_dropout (bool) -- if use dropout layers.
         init_type (str)    -- the name of our initialization method.
@@ -156,7 +201,20 @@ def define_G(input_nc, output_nc, ngf, netG, norm="batch", use_dropout=False, in
     elif netG == "unet_256":
         net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     else:
-        raise NotImplementedError("Generator model name [%s] is not recognized" % netG)
+        resunet_spec = _parse_resunet_spec(netG)
+        if resunet_spec is not None:
+            num_downs, bottleneck_blocks = resunet_spec
+            net = ResUnetGenerator(
+                input_nc,
+                output_nc,
+                num_downs,
+                ngf,
+                norm_layer=norm_layer,
+                use_dropout=use_dropout,
+                bottleneck_blocks=bottleneck_blocks,
+            )
+        else:
+            raise NotImplementedError("Generator model name [%s] is not recognized" % netG)
     return net
 
 
@@ -419,6 +477,162 @@ class ResnetBlock(nn.Module):
         """Forward function (with skip connections)"""
         out = x + self.conv_block(x)  # add skip connections
         return out
+
+
+class ResUnetGenerator(nn.Module):
+    """Create a residual U-Net generator.
+
+    This generator keeps the U-Net encoder-decoder topology, but each stage
+    uses residual blocks to improve feature reuse and gradient flow.
+    """
+
+    def __init__(self, input_nc, output_nc, num_downs, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, bottleneck_blocks=4):
+        """Construct a ResUnet generator.
+
+        Parameters:
+            input_nc (int)  -- the number of channels in input images
+            output_nc (int) -- the number of channels in output images
+            num_downs (int) -- the number of downsampling stages
+            ngf (int)       -- the base number of filters
+            norm_layer      -- normalization layer
+            use_dropout (bool) -- if use dropout layers in bottleneck blocks
+            bottleneck_blocks (int) -- number of residual blocks at the bottleneck
+        """
+        super(ResUnetGenerator, self).__init__()
+        if type(norm_layer) == functools.partial:
+            use_bias = norm_layer.func == nn.InstanceNorm2d
+        else:
+            use_bias = norm_layer == nn.InstanceNorm2d
+
+        self.stem = nn.Sequential(
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
+            norm_layer(ngf),
+            nn.ReLU(True),
+        )
+
+        self.down_blocks = nn.ModuleList()
+        self.skip_channels = []
+        in_channels = ngf
+        for i in range(num_downs):
+            out_channels = min(ngf * (2 ** (i + 1)), ngf * 8)
+            self.down_blocks.append(
+                _ResUnetDownBlock(
+                    in_channels,
+                    out_channels,
+                    norm_layer=norm_layer,
+                    use_bias=use_bias,
+                )
+            )
+            self.skip_channels.append(in_channels)
+            in_channels = out_channels
+
+        bottleneck = []
+        for _ in range(bottleneck_blocks):
+            bottleneck.append(
+                ResnetBlock(
+                    in_channels,
+                    padding_type="zero",
+                    norm_layer=norm_layer,
+                    use_dropout=use_dropout,
+                    use_bias=use_bias,
+                )
+            )
+        self.bottleneck = nn.Sequential(*bottleneck)
+
+        self.up_blocks = nn.ModuleList()
+        for skip_channels in reversed(self.skip_channels):
+            self.up_blocks.append(
+                _ResUnetUpBlock(
+                    in_channels,
+                    skip_channels,
+                    skip_channels,
+                    norm_layer=norm_layer,
+                    use_bias=use_bias,
+                    use_dropout=use_dropout,
+                )
+            )
+            in_channels = skip_channels
+
+        self.head = nn.Sequential(
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0),
+            nn.Tanh(),
+        )
+
+    def forward(self, input):
+        """Standard forward."""
+        x = self.stem(input)
+        skips = []
+        for down_block in self.down_blocks:
+            skip, x = down_block(x)
+            skips.append(skip)
+
+        x = self.bottleneck(x)
+
+        for up_block, skip in zip(self.up_blocks, reversed(skips)):
+            x = up_block(x, skip)
+
+        return self.head(x)
+
+
+class _ResUnetDownBlock(nn.Module):
+    """Residual encoder block with strided downsampling."""
+
+    def __init__(self, input_nc, output_nc, norm_layer=nn.BatchNorm2d, use_bias=False):
+        super(_ResUnetDownBlock, self).__init__()
+        self.res_block = ResnetBlock(
+            input_nc,
+            padding_type="reflect",
+            norm_layer=norm_layer,
+            use_dropout=False,
+            use_bias=use_bias,
+        )
+        self.down = nn.Sequential(
+            nn.Conv2d(input_nc, output_nc, kernel_size=4, stride=2, padding=1, bias=use_bias),
+            norm_layer(output_nc),
+            nn.LeakyReLU(0.2, True),
+        )
+
+    def forward(self, x):
+        skip = self.res_block(x)
+        down = self.down(skip)
+        return skip, down
+
+
+class _ResUnetUpBlock(nn.Module):
+    """Residual decoder block with skip fusion."""
+
+    def __init__(self, input_nc, skip_nc, output_nc, norm_layer=nn.BatchNorm2d, use_bias=False, use_dropout=False):
+        super(_ResUnetUpBlock, self).__init__()
+        self.up = nn.Sequential(
+            nn.ConvTranspose2d(input_nc, output_nc, kernel_size=4, stride=2, padding=1, bias=use_bias),
+            norm_layer(output_nc),
+            nn.ReLU(True),
+        )
+        fused_nc = output_nc + skip_nc
+        self.fuse = nn.Sequential(
+            nn.Conv2d(fused_nc, output_nc, kernel_size=1, stride=1, padding=0, bias=use_bias),
+            norm_layer(output_nc),
+            nn.ReLU(True),
+            ResnetBlock(
+                output_nc,
+                padding_type="reflect",
+                norm_layer=norm_layer,
+                use_dropout=use_dropout,
+                use_bias=use_bias,
+            ),
+        )
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            min_h = min(x.shape[-2], skip.shape[-2])
+            min_w = min(x.shape[-1], skip.shape[-1])
+            x = x[:, :, :min_h, :min_w]
+            skip = skip[:, :, :min_h, :min_w]
+        x = torch.cat([x, skip], dim=1)
+        return self.fuse(x)
 
 
 class UnetGenerator(nn.Module):
