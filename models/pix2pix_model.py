@@ -65,8 +65,8 @@ class Pix2PixModel(BaseModel):
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)  # move to the device for custom loss
             self.criterionL1 = torch.nn.L1Loss()
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
-            self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
-            self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+            self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr_G, betas=(opt.beta1, 0.999))
+            self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr_D, betas=(opt.beta1, 0.999))
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
 
@@ -116,12 +116,27 @@ class Pix2PixModel(BaseModel):
     def optimize_parameters(self):
         self.forward()  # compute fake images: G(A)
         # update D
-        self.set_requires_grad(self.netD, True)  # enable backprop for D
-        self.optimizer_D.zero_grad()  # set D's gradients to zero
-        self.backward_D()  # calculate gradients for D
-        self.optimizer_D.step()  # update D's weights
+        # self.set_requires_grad(self.netD, True)  # enable backprop for D
+        # self.optimizer_D.zero_grad()  # set D's gradients to zero
+        # self.backward_D()  # calculate gradients for D
+        # self.optimizer_D.step()  # update D's weights
+        self.set_requires_grad(self.netD, True)
+        self.netD.train()
+        self.optimizer_D.zero_grad()
+        self.backward_D()
+        self.optimizer_D.step()
+
         # update G
+        # self.set_requires_grad(self.netD, False)  # D requires no gradients when optimizing G
+        # self.optimizer_G.zero_grad()  # set G's gradients to zero
+        # self.backward_G()  # calculate graidents for G
+        # self.optimizer_G.step()  # update G's weights
         self.set_requires_grad(self.netD, False)  # D requires no gradients when optimizing G
-        self.optimizer_G.zero_grad()  # set G's gradients to zero
-        self.backward_G()  # calculate graidents for G
-        self.optimizer_G.step()  # update G's weights
+        for _ in range(self.opt.G_rounds):
+            self.optimizer_G.zero_grad()
+            if self.opt.G_rounds > 1:
+                # 在多轮更新才重新生成图像，节省资源
+                # 重新生成 fake 图像（仅 G 的前向），复用真实图像
+                self.fake_B = self.netG(self.real_A)
+            self.backward_G()             # 注意：backward_G 中会用到 self.fake_B 和 self.real_B
+            self.optimizer_G.step()
