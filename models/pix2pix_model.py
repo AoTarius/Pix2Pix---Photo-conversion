@@ -1,6 +1,109 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from .base_model import BaseModel
 from . import networks
+
+
+class OptionalLosses(nn.Module):
+    def __init__(self, opt, netD, device):
+        super(OptionalLosses, self).__init__()
+        self.opt = opt
+        self.netD = netD
+        self.device = device
+        self.use_perception_loss = getattr(opt, "use_perception_loss", False)
+        self.use_feature_matching_loss = getattr(opt, "use_feature_matching_loss", False)
+        self.use_gradient_loss = getattr(opt, "use_gradient_loss", False)
+        self.vgg_features = None
+
+        if self.use_perception_loss:
+            self.vgg_features = self._build_vgg_features()
+            self.vgg_features.eval()
+            for parameter in self.vgg_features.parameters():
+                parameter.requires_grad = False
+
+    def _build_vgg_features(self):
+        try:
+            from torchvision import models as torchvision_models
+
+            vgg = torchvision_models.vgg16(weights=None)
+            features = nn.Sequential(*list(vgg.features.children())[:16])
+        except Exception:
+            features = nn.Sequential()
+        return features.to(self.device)
+
+    def _normalize_for_vgg(self, image):
+        if image.shape[1] == 1:
+            image = image.repeat(1, 3, 1, 1)
+        image = (image + 1.0) * 0.5
+        mean = torch.tensor([0.485, 0.456, 0.406], device=image.device, dtype=image.dtype).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=image.device, dtype=image.dtype).view(1, 3, 1, 1)
+        return (image - mean) / std
+
+    def _get_discriminator_layers(self):
+        if hasattr(self.netD, "model") and isinstance(self.netD.model, nn.Sequential):
+            return list(self.netD.model.children())
+        if hasattr(self.netD, "net") and isinstance(self.netD.net, nn.Sequential):
+            return list(self.netD.net.children())
+        if isinstance(self.netD, nn.Sequential):
+            return list(self.netD.children())
+        return None
+
+    def _discriminator_feature_maps(self, input_tensor):
+        layers = self._get_discriminator_layers()
+        if layers is None or len(layers) < 2:
+            return []
+
+        features = []
+        current = input_tensor
+        for index, layer in enumerate(layers[:-1]):
+            current = layer(current)
+            features.append(current)
+        return features
+
+    def perception_loss(self, fake_image, real_image):
+        if not self.use_perception_loss or self.vgg_features is None or len(self.vgg_features) == 0:
+            return fake_image.new_tensor(0.0)
+
+        fake_input = self._normalize_for_vgg(fake_image)
+        real_input = self._normalize_for_vgg(real_image)
+        fake_features = self.vgg_features(fake_input)
+        with torch.no_grad():
+            real_features = self.vgg_features(real_input)
+        return F.l1_loss(fake_features, real_features)
+
+    def feature_matching_loss(self, fake_ab, real_ab):
+        if not self.use_feature_matching_loss:
+            return fake_ab.new_tensor(0.0)
+
+        fake_features = self._discriminator_feature_maps(fake_ab)
+        if not fake_features:
+            return fake_ab.new_tensor(0.0)
+
+        with torch.no_grad():
+            real_features = self._discriminator_feature_maps(real_ab)
+
+        if len(real_features) == 0:
+            return fake_ab.new_tensor(0.0)
+
+        loss = fake_ab.new_tensor(0.0)
+        pair_count = min(len(fake_features), len(real_features))
+        for index in range(pair_count):
+            loss = loss + F.l1_loss(fake_features[index], real_features[index])
+        return loss / pair_count
+
+    def gradient_loss(self, fake_image, real_image):
+        if not self.use_gradient_loss:
+            return fake_image.new_tensor(0.0)
+
+        fake_dx = fake_image[:, :, :, 1:] - fake_image[:, :, :, :-1]
+        fake_dy = fake_image[:, :, 1:, :] - fake_image[:, :, :-1, :]
+        real_dx = real_image[:, :, :, 1:] - real_image[:, :, :, :-1]
+        real_dy = real_image[:, :, 1:, :] - real_image[:, :, :-1, :]
+
+        loss_x = F.l1_loss(fake_dx, real_dx)
+        loss_y = F.l1_loss(fake_dy, real_dy)
+        return 0.5 * (loss_x + loss_y)
 
 
 class Pix2PixModel(BaseModel):
@@ -34,6 +137,9 @@ class Pix2PixModel(BaseModel):
         if is_train:
             parser.set_defaults(pool_size=0, gan_mode="vanilla")
             parser.add_argument("--lambda_L1", type=float, default=100.0, help="weight for L1 loss")
+            parser.add_argument("--lambda_Perception", type=float, default=0.0, help="weight for perception loss")
+            parser.add_argument("--lambda_FM", type=float, default=0.0, help="weight for feature matching loss")
+            parser.add_argument("--lambda_Gradient", type=float, default=0.0, help="weight for gradient loss")
 
         return parser
 
@@ -64,6 +170,20 @@ class Pix2PixModel(BaseModel):
             # define loss functions
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)  # move to the device for custom loss
             self.criterionL1 = torch.nn.L1Loss()
+            # 在 Pix2PixModel.__init__ 中，实例化 optional_losses 之前添加：
+            if opt.lambda_Perception > 0:
+                opt.use_perception_loss = True
+            if opt.lambda_FM > 0:
+                opt.use_feature_matching_loss = True
+            if opt.lambda_Gradient > 0:
+                opt.use_gradient_loss = True
+            self.optional_losses = OptionalLosses(opt, self.netD, self.device)
+            if opt.lambda_Perception > 0.0:
+                self.loss_names.append("G_Perception")
+            if opt.lambda_FM > 0.0:
+                self.loss_names.append("G_FM")
+            if opt.lambda_Gradient > 0.0:
+                self.loss_names.append("G_Gradient")
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
             self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr_G, betas=(opt.beta1, 0.999))
             self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr_D, betas=(opt.beta1, 0.999))
@@ -109,8 +229,18 @@ class Pix2PixModel(BaseModel):
         self.loss_G_GAN = self.criterionGAN(pred_fake, True)
         # Second, G(A) = B
         self.loss_G_L1 = self.criterionL1(self.fake_B, self.real_B) * self.opt.lambda_L1
-        # combine loss and calculate gradients
+        # Optional auxiliary losses
         self.loss_G = self.loss_G_GAN + self.loss_G_L1
+        if self.opt.lambda_Perception > 0.0:
+            self.loss_G_Perception = self.optional_losses.perception_loss(self.fake_B, self.real_B) * self.opt.lambda_Perception
+            self.loss_G = self.loss_G + self.loss_G_Perception
+        if self.opt.lambda_FM > 0.0:
+            self.loss_G_FM = self.optional_losses.feature_matching_loss(fake_AB, torch.cat((self.real_A, self.real_B), 1)) * self.opt.lambda_FM
+            self.loss_G = self.loss_G + self.loss_G_FM
+        if self.opt.lambda_Gradient > 0.0:
+            self.loss_G_Gradient = self.optional_losses.gradient_loss(self.fake_B, self.real_B) * self.opt.lambda_Gradient
+            self.loss_G = self.loss_G + self.loss_G_Gradient
+        # combine loss and calculate gradients
         self.loss_G.backward()
 
     def optimize_parameters(self):

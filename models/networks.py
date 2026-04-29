@@ -175,7 +175,7 @@ def _parse_resunet_spec(netG, default_num_downs=8, default_bottleneck_blocks=4):
     return num_downs, bottleneck_blocks
 
 
-def _parse_unetpp_spec(netG, default_num_stages=4):
+def _parse_unetpp_spec(netG, default_num_stages=6):
     """Parse Unet++ configuration from a netG string.
 
     Supported forms:
@@ -185,8 +185,9 @@ def _parse_unetpp_spec(netG, default_num_stages=4):
         UnetPP_256_d4
 
     For canonical image-size tokens (128/256/512), this implementation uses
-    the default 4-stage UNet++ topology. Explicit stage depth can be provided
-    with tokens like d4/d5/d6.
+    a deeper 6-stage UNet++ topology by default so it is closer in capacity
+    to the built-in unet_256 generator. Explicit stage depth can still be
+    provided with tokens like d4/d5/d6.
     """
     spec = str(netG).lower().replace("unet++", "unetpp").replace("unet_plus_plus", "unetpp")
     if not spec.startswith("unetpp"):
