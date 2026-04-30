@@ -25,8 +25,9 @@ class OptionalLosses(nn.Module):
     def _build_vgg_features(self):
         try:
             from torchvision import models as torchvision_models
+            from torchvision.models import VGG16_Weights
 
-            vgg = torchvision_models.vgg16(weights=None)
+            vgg = torchvision_models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
             features = nn.Sequential(*list(vgg.features.children())[:16])
         except Exception:
             features = nn.Sequential()
@@ -54,12 +55,10 @@ class OptionalLosses(nn.Module):
         if layers is None or len(layers) < 2:
             return []
 
-        features = []
         current = input_tensor
-        for index, layer in enumerate(layers[:-1]):
+        for layer in layers[:-1]:
             current = layer(current)
-            features.append(current)
-        return features
+        return [current]
 
     def perception_loss(self, fake_image, real_image):
         if not self.use_perception_loss or self.vgg_features is None or len(self.vgg_features) == 0:
@@ -86,11 +85,7 @@ class OptionalLosses(nn.Module):
         if len(real_features) == 0:
             return fake_ab.new_tensor(0.0)
 
-        loss = fake_ab.new_tensor(0.0)
-        pair_count = min(len(fake_features), len(real_features))
-        for index in range(pair_count):
-            loss = loss + F.l1_loss(fake_features[index], real_features[index])
-        return loss / pair_count
+        return F.l1_loss(fake_features[0], real_features[0])
 
     def gradient_loss(self, fake_image, real_image):
         if not self.use_gradient_loss:
