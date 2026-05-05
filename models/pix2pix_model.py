@@ -245,11 +245,12 @@ class Pix2PixModel(BaseModel):
         # self.optimizer_D.zero_grad()  # set D's gradients to zero
         # self.backward_D()  # calculate gradients for D
         # self.optimizer_D.step()  # update D's weights
-        self.set_requires_grad(self.netD, True)
-        self.netD.train()
-        self.optimizer_D.zero_grad()
-        self.backward_D()
-        self.optimizer_D.step()
+        for _ in range(self.opt.D_rounds):
+            self.set_requires_grad(self.netD, True)
+            self.netD.train()
+            self.optimizer_D.zero_grad()
+            self.backward_D()
+            self.optimizer_D.step()
 
         # update G
         # self.set_requires_grad(self.netD, False)  # D requires no gradients when optimizing G

@@ -25,6 +25,7 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--n_epochs', type=int, default=100, help='number of epochs with the initial learning rate')
         parser.add_argument('--n_epochs_decay', type=int, default=100, help='number of epochs to linearly decay learning rate to zero')
         parser.add_argument('--beta1', type=float, default=0.5, help='momentum term of adam')
+        parser.add_argument('--D_rounds', type=int, default=1, help='number of discriminator backward rounds per generator backward round')
         parser.add_argument('--G_rounds', type=int, default=1, help='number of generator backward rounds per discriminator backward round')
         parser.add_argument('--lr_G', type=float, default=0.0002, help='initial learning rate for generator adam')
         parser.add_argument('--lr_D', type=float, default=0.0002, help='initial learning rate for discriminator adam')
