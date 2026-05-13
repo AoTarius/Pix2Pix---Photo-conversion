@@ -135,6 +135,7 @@ class Pix2PixModel(BaseModel):
             parser.add_argument("--lambda_Perception", type=float, default=0.0, help="weight for perception loss")
             parser.add_argument("--lambda_FM", type=float, default=0.0, help="weight for feature matching loss")
             parser.add_argument("--lambda_Gradient", type=float, default=0.0, help="weight for gradient loss")
+            parser.add_argument('--pre_train', action='store_true', help='pre-train the generator with only L1 loss while the discriminator is frozen')
 
         return parser
 
@@ -239,12 +240,55 @@ class Pix2PixModel(BaseModel):
         self.loss_G.backward()
 
     def optimize_parameters(self):
-        self.forward()  # compute fake images: G(A)
-        # update D
-        # self.set_requires_grad(self.netD, True)  # enable backprop for D
-        # self.optimizer_D.zero_grad()  # set D's gradients to zero
-        # self.backward_D()  # calculate gradients for D
-        # self.optimizer_D.step()  # update D's weights
+        self.forward()                     # 计算 fake_B = G(A)
+
+        # ============================================================
+        # 预训练阶段：只更新 G，使用纯 L1（及可能的辅助损失），D 冻结
+        # ============================================================
+        if self.opt.pre_train:
+            # 冻结判别器
+            self.set_requires_grad(self.netD, False)
+            # 判别器相关损失置零（用于日志打印）
+            self.loss_D_real = torch.tensor(0.0, device=self.device)
+            self.loss_D_fake = torch.tensor(0.0, device=self.device)
+            self.loss_D = torch.tensor(0.0, device=self.device)
+            self.loss_G_GAN = torch.tensor(0.0, device=self.device)
+
+            for _ in range(self.opt.G_rounds):
+                self.optimizer_G.zero_grad()
+
+                # 若 G_rounds > 1，重新生成 fake_B
+                if self.opt.G_rounds > 1:
+                    self.fake_B = self.netG(self.real_A)
+
+                # L1 损失
+                self.loss_G_L1 = self.criterionL1(self.fake_B, self.real_B) * self.opt.lambda_L1
+                self.loss_G = self.loss_G_L1
+
+                # 可选的辅助损失（感知、特征匹配、梯度）
+                if self.opt.lambda_Perception > 0.0:
+                    self.loss_G_Perception = self.optional_losses.perception_loss(
+                        self.fake_B, self.real_B) * self.opt.lambda_Perception
+                    self.loss_G += self.loss_G_Perception
+                if self.opt.lambda_FM > 0.0:
+                    fake_ab = torch.cat((self.real_A, self.fake_B), 1)
+                    real_ab = torch.cat((self.real_A, self.real_B), 1)
+                    self.loss_G_FM = self.optional_losses.feature_matching_loss(fake_ab, real_ab) * self.opt.lambda_FM
+                    self.loss_G += self.loss_G_FM
+                if self.opt.lambda_Gradient > 0.0:
+                    self.loss_G_Gradient = self.optional_losses.gradient_loss(
+                        self.fake_B, self.real_B) * self.opt.lambda_Gradient
+                    self.loss_G += self.loss_G_Gradient
+
+                self.loss_G.backward()
+                self.optimizer_G.step()
+
+            return  # 预训练阶段到此结束
+
+        # ============================================================
+        # 正常对抗训练（原逻辑）
+        # ============================================================
+        # 更新 D
         for _ in range(self.opt.D_rounds):
             self.set_requires_grad(self.netD, True)
             self.netD.train()
@@ -252,17 +296,11 @@ class Pix2PixModel(BaseModel):
             self.backward_D()
             self.optimizer_D.step()
 
-        # update G
-        # self.set_requires_grad(self.netD, False)  # D requires no gradients when optimizing G
-        # self.optimizer_G.zero_grad()  # set G's gradients to zero
-        # self.backward_G()  # calculate graidents for G
-        # self.optimizer_G.step()  # update G's weights
-        self.set_requires_grad(self.netD, False)  # D requires no gradients when optimizing G
+        # 更新 G
+        self.set_requires_grad(self.netD, False)
         for _ in range(self.opt.G_rounds):
             self.optimizer_G.zero_grad()
             if self.opt.G_rounds > 1:
-                # 在多轮更新才重新生成图像，节省资源
-                # 重新生成 fake 图像（仅 G 的前向），复用真实图像
                 self.fake_B = self.netG(self.real_A)
-            self.backward_G()             # 注意：backward_G 中会用到 self.fake_B 和 self.real_B
+            self.backward_G()
             self.optimizer_G.step()
